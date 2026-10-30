@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Prime Vault</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔐</text></svg>">
+<style>
+:root{--bg:#f4f1ea;--card:#fff;--fg:#1d2230;--muted:#5d6678;--line:#d9d4c7;--acc:#5b3fd1;--accfg:#fff;--bad:#b3261e;--ok:#1b7a3d;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12141c;--card:#1b1f2b;--fg:#e8eaf2;--muted:#9aa3b8;--line:#2c3244;--acc:#9d87ff;--accfg:#12141c;--bad:#ff8a80;--ok:#6fdc8c}}
+:root[data-theme="dark"]{--bg:#12141c;--card:#1b1f2b;--fg:#e8eaf2;--muted:#9aa3b8;--line:#2c3244;--acc:#9d87ff;--accfg:#12141c;--bad:#ff8a80;--ok:#6fdc8c}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:820px;margin:0 auto;padding:22px 16px 40px}
+h1{margin:0 0 4px;font-size:1.6rem}.sub{color:var(--muted);margin:0 0 18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+label{display:block;font-weight:600;margin-bottom:6px}
+textarea,input{width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit}
+textarea{min-height:150px;resize:vertical;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+button{border:1px solid var(--acc);background:transparent;color:var(--acc);border-radius:10px;padding:9px 14px;font:inherit;font-weight:600;cursor:pointer}
+button.p{background:var(--acc);color:var(--accfg)}button:disabled{opacity:.5;cursor:wait}
+.meta{font-size:.82rem;color:var(--muted);margin-top:6px}.err{color:var(--bad)}.good{color:var(--ok)}
+.keyrow{display:flex;gap:8px}.keyrow input{flex:1}
+</style></head><body><main>
+<h1>Prime Vault</h1>
+<p class="sub">A keyed prime-number cipher that runs entirely in your browser. Nothing is uploaded.</p>
+<div class="card">
+ <label for="key">Secret key</label>
+ <div class="keyrow"><input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="At least 12 characters, longer is better"><button id="show" type="button">Show</button></div>
+ <div class="row"><button id="gen" type="button">Generate a strong key</button><button id="copykey" type="button">Copy key</button></div>
+ <div class="meta">Save the key in a password manager. Without the exact key a message can’t be decoded, and nobody can recover it for you.</div>
+</div>
+<div class="card">
+ <label for="in">Input (a message to encode, or any pasted text that contains a Prime Vault code)</label>
+ <div class="row" style="margin:0 0 8px"><button id="up" type="button">Upload a PDF or text file to decode</button><input id="file" type="file" accept=".pdf,.txt,.text,.md,.json,.csv,.html,application/pdf,text/*" hidden></div>
+ <textarea id="in" spellcheck="false"></textarea>
+ <div class="meta" id="count">0 / 200,000 bytes</div>
+ <div class="row"><button class="p" id="enc" type="button">Encode</button><button id="dec" type="button">Decode</button><button id="clr" type="button">Clear</button></div>
+</div>
+<div class="card">
+ <label for="out">Result</label>
+ <textarea id="out" readonly spellcheck="false"></textarea>
+ <div class="meta" id="status" role="status">Ready.</div>
+ <div class="row"><button id="copyout" type="button">Copy result</button><button id="swap" type="button">Use result as input</button></div>
+</div>
+<div class="card meta">Limit: 200,000 bytes of message per run. That is about 200,000 English characters, about 66,000 Devanagari characters (3 bytes each) or about 50,000 emoji (4 bytes each). each byte becomes a code of up to 5 characters plus a separator, so the largest code is about 1 MB of text. Reading a PDF loads a PDF reader from the internet the first time; the file itself never leaves your device. Scanned (image-only) PDFs have no text to read.</div>
+</main>
+<script>
+//CORE-START
+const te=new TextEncoder(),MAX=200000,ITER=200000;
+const P=(()=>{const p=[];for(let x=2;p.length<256;x++){let ok=true;for(const q of p){if(q*q>x)break;if(x%q===0){ok=false;break}}if(ok)p.push(x)}return p})();
+const PIDX=new Map(P.map((p,i)=>[p,i]));
+const b64=u=>btoa(String.fromCharCode(...u)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const unb64=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
+const hex=u=>[...u].map(x=>x.toString(16).padStart(2,'0')).join('');
+const S=crypto.subtle;
+async function derive(pass,salt){
+  const km=await S.importKey('raw',te.encode(pass),'PBKDF2',false,['deriveBits']);
+  const d=new Uint8Array(await S.deriveBits({name:'PBKDF2',hash:'SHA-256',salt,iterations:ITER},km,1024));
+  return {k1:d.slice(0,32),k2:d.slice(32,64),k3:d.slice(64,96),k4:d.slice(96,128)};
+}
+const hk=k=>S.importKey('raw',k,{name:'HMAC',hash:'SHA-256'},false,['sign']);
+async function stream(key,n){
+  const k=await hk(key),blocks=Math.ceil(n/32),out=new Uint8Array(Math.max(blocks,1)*32);
+  for(let s=0;s<blocks;s+=500){const jobs=[];for(let i=s;i<Math.min(blocks,s+500);i++){const c=new Uint8Array(4);new DataView(c.buffer).setUint32(0,i);jobs.push(S.sign('HMAC',k,c).then(r=>out.set(new Uint8Array(r),i*32)))}await Promise.all(jobs)}
+  return out;
+}
+async function shuffle(n,key){ // keyed Fisher-Yates permutation of 0..n-1
+  const ks=await stream(key,Math.max(n*4,4)),dv=new DataView(ks.buffer),a=Array.from({length:n},(_,i)=>i);
+  for(let i=n-1;i>0;i--){const j=dv.getUint32((n-1-i)*4)%(i+1);[a[i],a[j]]=[a[j],a[i]]}
+  return a;
+}
+async function tag(k2,salt,nums){
+  const m=new Uint8Array(salt.length+nums.length*4);m.set(salt);const dv=new DataView(m.buffer);nums.forEach((x,i)=>dv.setUint32(salt.length+i*4,x));
+  return new Uint8Array(await S.sign('HMAC',await hk(k2),m)).slice(0,16);
+}
+async function encode(text,pass){
+  if(pass.length<12)throw new Error('Key must be at least 12 characters.');
+  const b=te.encode(text);if(!b.length)throw new Error('Nothing to encode.');if(b.length>MAX)throw new Error('Message is over the '+MAX.toLocaleString()+'-byte limit.');
+  const salt=crypto.getRandomValues(new Uint8Array(16)),K=await derive(pass,salt);
+  const perm=await shuffle(256,K.k1),ks=await stream(K.k3,b.length),n=b.length,nums=new Array(n);
+  let prev=K.k1[0];
+  for(let i=0;i<n;i++){const v=(b[i]+ks[i]+prev)&255;prev=v;const p=P[perm[v]];nums[i]=p*p+1}   // chain, keyed prime pick, p^2+1
+  const order=await shuffle(n,K.k4),mixed=new Array(n);
+  for(let j=0;j<n;j++)mixed[j]=nums[order[j]];                                                   // keyed transposition
+  mixed.reverse();                                                                                // reversal
+  const t=await tag(K.k2,salt,mixed);
+  return 'PQ1.'+b64(salt)+'.'+hex(t)+'.'+mixed.map(x=>x.toString(36)).join('-');
+}
+async function decode(code,pass){
+  const m=/^PQ1\.([\w-]+)\.([0-9a-f]{32})\.([0-9a-z-]+)$/.exec(code.trim());if(!m)throw new Error('This is not a Prime Vault code.');
+  const salt=unb64(m[1]),mixed=m[3].split('-').map(x=>parseInt(x,36)),n=mixed.length;
+  if(salt.length!==16||n>MAX)throw new Error('Code is malformed or too large.');
+  const K=await derive(pass,salt),t=hex(await tag(K.k2,salt,mixed));
+  let d=0;for(let i=0;i<32;i++)d|=t.charCodeAt(i)^m[2].charCodeAt(i);
+  if(d)throw new Error('Wrong key, or the code was changed.');
+  mixed.reverse();const order=await shuffle(n,K.k4),nums=new Array(n);
+  for(let j=0;j<n;j++)nums[order[j]]=mixed[j];
+  const perm=await shuffle(256,K.k1),inv=new Array(256);perm.forEach((x,v)=>{inv[x]=v});
+  const ks=await stream(K.k3,n),b=new Uint8Array(n);let prev=K.k1[0];
+  for(let i=0;i<n;i++){const r=Math.round(Math.sqrt(nums[i]-1));if(r*r!==nums[i]-1||!PIDX.has(r))throw new Error('Code is corrupted.');const v=inv[PIDX.get(r)];b[i]=(v-ks[i]-prev)&255;prev=v}
+  return new TextDecoder('utf-8',{fatal:true}).decode(b);
+}
+function makeKey(){const A='ABCDEFGHJKLMNPQRSTUVWXYZ23456789',r=crypto.getRandomValues(new Uint8Array(40));let s='';r.forEach((x,i)=>{s+=A[x&31];if(i%5===4&&i<39)s+='-'});return s}
+//CORE-END
+const $=id=>document.getElementById(id);
+const status=(t,c)=>{const s=$('status');s.textContent=t;s.className='meta '+(c||'')};
+$('in').addEventListener('input',()=>{const n=te.encode($('in').value).length;$('count').textContent=n.toLocaleString()+' / 200,000 bytes';$('count').className='meta '+(n>MAX?'err':'')});
+$('show').onclick=()=>{const k=$('key');k.type=k.type==='password'?'text':'password';$('show').textContent=k.type==='password'?'Show':'Hide'};
+$('gen').onclick=()=>{$('key').value=makeKey();$('key').type='text';$('show').textContent='Hide';status('New random key created in your browser (about 200 bits). Copy it somewhere safe now.','good')};
+const copy=async(t,msg)=>{try{await navigator.clipboard.writeText(t);status(msg,'good')}catch(e){status('Copy failed; select the text and copy it manually.','err')}};
+$('copykey').onclick=()=>copy($('key').value,'Key copied.');
+$('copyout').onclick=()=>copy($('out').value,'Result copied.');
+$('swap').onclick=()=>{$('in').value=$('out').value;$('in').dispatchEvent(new Event('input'));$('out').value=''};
+$('clr').onclick=()=>{$('in').value='';$('out').value='';$('in').dispatchEvent(new Event('input'));status('Cleared.')};
+async function run(fn,btn,label){
+  const btns=document.querySelectorAll('button');btns.forEach(b=>b.disabled=true);status(label+'…');
+  try{const t0=performance.now();$('out').value=await fn($('in').value,$('key').value);status('Done in '+Math.round(performance.now()-t0)+' ms.','good')}
+  catch(e){$('out').value='';status(e.message||'Something went wrong.','err')}
+  btns.forEach(b=>b.disabled=false);
+}
+$('enc').onclick=()=>run(encode,$('enc'),'Encoding');
+// ---- find codes in pasted or uploaded text ----
+const STRICT=/^PQ1\.[A-Za-z0-9_-]{22}\.[0-9a-f]{32}\.[0-9a-z]+(?:-[0-9a-z]+)*/,HEAD=/^PQ1\.[\w-]{22}\.[0-9a-f]{32}\.[0-9a-z]/;
+function findCodes(text){ // returns, per code found, a list of candidate readings (line wraps can split a code)
+  const starts=[...text.matchAll(/PQ1\./g)].map(m=>m.index),out=[];
+  starts.forEach((st,k)=>{
+    const seg=text.slice(st,k+1<starts.length?starts[k+1]:undefined),cands=[];
+    const pc=seg.split(/\s+/).filter(Boolean);let c=pc[0];
+    for(let i=1;i<pc.length;i++){if(!HEAD.test(c)||c.endsWith('-')||pc[i].startsWith('-'))c+=pc[i];else break}
+    [c,seg.replace(/\s+/g,'')].forEach(x=>{const m=STRICT.exec(x);if(m&&!cands.includes(m[0]))cands.push(m[0])});
+    if(cands.length)out.push(cands);
+  });
+  return out;
+}
+async function pickValid(cands,pass){ // line wraps or trailing words can blur where a code ends, so the integrity tag decides which reading is right
+  const m0=/^PQ1\.([\w-]{22})\.([0-9a-f]{32})\./.exec(cands[0]);if(!m0)return cands[0];
+  const salt=unb64(m0[1]),K=await derive(pass,salt);
+  for(const c of cands){
+    const big=c.length>40000;
+    for(let len=c.length,lim=c.length-(big?20:300);len>lim&&len>60;len--){
+      const t=c.slice(0,len);if(t.endsWith('-')||!(STRICT.exec(t)||[])[0]||STRICT.exec(t)[0]!==t)continue;
+      const nums=t.split('.')[3].split('-').map(x=>parseInt(x,36));
+      if(hex(await tag(K.k2,salt,nums))===m0[2])return t;
+    }
+  }
+  return cands[0];
+}
+async function decodeAll(text,pass){
+  const groups=findCodes(text);if(!groups.length)throw new Error('No Prime Vault code (it starts with PQ1.) was found in this text.');
+  const res=[];
+  for(const [gi,cands] of groups.entries()){
+    try{const out=await decode(await pickValid(cands,pass),pass);res.push(groups.length>1?'[code '+(gi+1)+'] '+out:out)}
+    catch(e){if(groups.length===1)throw e;res.push('[code '+(gi+1)+'] '+e.message)}
+  }
+  return res.join('\n');
+}
+// ---- file reading ----
+const PDFJS='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',PDFW='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+function loadPdfJs(){return window.pdfjsLib?Promise.resolve():new Promise((ok,no)=>{const s=document.createElement('script');s.src=PDFJS;s.onload=ok;s.onerror=()=>no(new Error('Could not load the PDF reader. Check your connection, or paste the text instead.'));document.head.appendChild(s)})}
+async function pdfText(buf){
+  await loadPdfJs();if(!pdfjsLib.GlobalWorkerOptions.workerSrc)pdfjsLib.GlobalWorkerOptions.workerSrc=PDFW;
+  const doc=await pdfjsLib.getDocument({data:buf}).promise;let t='';
+  for(let p=1;p<=doc.numPages;p++){const c=await(await doc.getPage(p)).getTextContent();t+=c.items.map(i=>i.str+(i.hasEOL?'\n':'')).join('')+'\n'}
+  return t;
+}
+async function loadFile(f){
+  if(!f)return;if(f.size>25e6){status('That file is over 25 MB.','err');return}
+  status('Reading '+f.name+'…');
+  try{
+    const isPdf=/\.pdf$/i.test(f.name)||f.type==='application/pdf';
+    const text=isPdf?await pdfText(new Uint8Array(await f.arrayBuffer())):await f.text();
+    if(!text.trim())throw new Error('No readable text in this file (scanned or image-only PDFs can’t be read).');
+    $('in').value=text;$('in').dispatchEvent(new Event('input'));
+    const n=findCodes(text).length;
+    if(!n){status('Read '+f.name+', but no Prime Vault code (starting with PQ1.) was found in it.','err');return}
+    if($('key').value.length>=12){await run(decodeAll,null,'Decoding')}else status('Found '+n+' code'+(n>1?'s':'')+' in '+f.name+'. Enter your key and press Decode.','good');
+  }catch(e){status(e.message||'Could not read that file.','err')}
+}
+$('up').onclick=()=>$('file').click();
+$('file').onchange=e=>{loadFile(e.target.files[0]);e.target.value=''};
+['dragover','drop'].forEach(ev=>$('in').addEventListener(ev,e=>{e.preventDefault();if(ev==='drop')loadFile(e.dataTransfer.files[0])}));
+$('dec').onclick=()=>run(decodeAll,$('dec'),'Decoding');
+</script></body></html>
